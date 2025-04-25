@@ -29,9 +29,9 @@ func NewClient(c internal.AlphaVantage) *Client {
 }
 
 func (c *Client) ProcessStockPerMonth(symbol, interval, month string, p market.Processing) error {
-	// Create an HTTP client to download CSV stock data and process it
 	httpClient := &http.Client{}
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s/query?function=TIME_SERIES_INTRADAY&symbol=%s&interval=%s&month=%s&outputsize=full&apikey=%s&datatype=csv", c.baseUrl, symbol, interval, month, c.token), nil)
+	url := fmt.Sprintf("%s/query?function=TIME_SERIES_INTRADAY&symbol=%s&interval=%s&month=%s&outputsize=full&apikey=%s&datatype=csv", c.baseUrl, symbol, interval, month, c.token)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return eris.Wrap(err, "failed to create request")
 	}
@@ -43,93 +43,99 @@ func (c *Client) ProcessStockPerMonth(symbol, interval, month string, p market.P
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return eris.Wrap(err, "received non-OK HTTP status")
+		return eris.Wrap(fmt.Errorf("unexpected HTTP status: %s", resp.Status), "received non-OK HTTP status")
 	}
 
-	// Check if the response is JSON
 	contentType := resp.Header.Get("Content-Type")
-	if contentType == "application/json" || contentType == "application/json; charset=utf-8" {
-		// Try to parse the body as JSON
-		bodyBytes, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return eris.Wrap(err, "failed to read response body")
+	if contentType != "" && (contentType == "application/json" || contentType == "application/json; charset=utf-8") {
+		bodyBytes, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return eris.Wrap(readErr, "failed to read response body")
 		}
-
-		var jsonBody interface{}
-		if json.Unmarshal(bodyBytes, &jsonBody) == nil {
-			log.Error().Interface("jsonBody", jsonBody).Msg("response returned JSON instead of expected CSV")
+		var asJson interface{}
+		if json.Unmarshal(bodyBytes, &asJson) == nil {
+			log.Error().Interface("jsonBody", asJson).Msg("response returned JSON instead of expected CSV")
 			return eris.New("response returned JSON instead of expected CSV")
 		}
+		// Not valid JSON either, return an error with first 200 chars to help debugging
+		return eris.Errorf("response returned neither CSV nor parseable JSON: %s", string(bodyBytes[:min(len(bodyBytes), 200)]))
 	}
 
-	// Create a new reader for further processing since the body has been read
 	reader := csv.NewReader(resp.Body)
-
-	// Typically, the first record in CSV is a header. Let's read it first.
-	_, err = reader.Read()
-	if err != nil {
+	if _, err = reader.Read(); err != nil {
 		return eris.Wrap(err, "failed to read CSV header")
 	}
 
-	// Iterate through CSV records one at a time
-	processed := 0
+	var processed int
 	for {
-		record, errRead := reader.Read()
-		if errRead == io.EOF {
+		record, err := reader.Read()
+		if err == io.EOF {
 			break
 		}
-		if errRead != nil {
-			return eris.Wrap(errRead, "error reading CSV record")
+		if err != nil {
+			return eris.Wrap(err, "error reading CSV record")
 		}
 
-		// Process each CSV record
-		// Customize this according to your market.Processing implementation
-		timestamp, errConvertTime := c.convertToTime(record[0])
-		if errConvertTime != nil {
-			return eris.Wrap(errConvertTime, "failed to convert time")
+		data, err := c.parseCSVRecord(symbol, record)
+		if err != nil {
+			return eris.Wrap(err, "cannot parse CSV record")
 		}
 
-		open, errOpen := c.convertToFloat(record[1])
-		if errOpen != nil {
-			return eris.Wrap(errOpen, "failed to convert open")
-		}
-
-		high, errHigh := c.convertToFloat(record[2])
-		if errHigh != nil {
-			return eris.Wrap(errHigh, "failed to convert high")
-		}
-
-		low, errLow := c.convertToFloat(record[3])
-		if errLow != nil {
-			return eris.Wrap(errLow, "failed to convert low")
-		}
-
-		cls, errClose := c.convertToFloat(record[4])
-		if errClose != nil {
-			return eris.Wrap(errClose, "failed to convert close")
-		}
-
-		volume, errVolume := c.convertToInt(record[5])
-		if errVolume != nil {
-			return eris.Wrap(errVolume, "failed to convert volume")
-		}
-
-		if errProcess := p.Process(market.InstrumentData{
-			Symbol:    symbol,
-			Timestamp: timestamp,
-			Open:      open,
-			High:      high,
-			Low:       low,
-			Close:     cls,
-			Volume:    volume,
-		}); errProcess != nil {
-			return eris.Wrap(errProcess, "failed to process record")
+		if processErr := p.Process(data); processErr != nil {
+			return eris.Wrap(processErr, "failed to process record")
 		}
 		processed++
 	}
 	log.Info().Int("processed", processed).Str("symbol", symbol).Str("month", month).Msg("processed records")
-
 	return nil
+}
+
+// parseCSVRecord parses a single record into market.InstrumentData, or returns a wrapped error with context.
+func (c *Client) parseCSVRecord(symbol string, record []string) (market.InstrumentData, error) {
+	if len(record) < 6 {
+		return market.InstrumentData{}, eris.New("CSV record: not enough fields")
+	}
+	timestamp, err := c.convertToTime(record[0])
+	if err != nil {
+		return market.InstrumentData{}, eris.Wrap(err, "failed to convert time")
+	}
+	open, err := c.convertToFloat(record[1])
+	if err != nil {
+		return market.InstrumentData{}, eris.Wrap(err, "failed to convert open")
+	}
+	high, err := c.convertToFloat(record[2])
+	if err != nil {
+		return market.InstrumentData{}, eris.Wrap(err, "failed to convert high")
+	}
+	low, err := c.convertToFloat(record[3])
+	if err != nil {
+		return market.InstrumentData{}, eris.Wrap(err, "failed to convert low")
+	}
+	cls, err := c.convertToFloat(record[4])
+	if err != nil {
+		return market.InstrumentData{}, eris.Wrap(err, "failed to convert close")
+	}
+	volume, err := c.convertToInt(record[5])
+	if err != nil {
+		return market.InstrumentData{}, eris.Wrap(err, "failed to convert volume")
+	}
+	return market.InstrumentData{
+		Symbol:    symbol,
+		Timestamp: timestamp,
+		Open:      open,
+		High:      high,
+		Low:       low,
+		Close:     cls,
+		Volume:    volume,
+	}, nil
+}
+
+// min helper to avoid panic when body on error is short
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (c *Client) convertToTime(s string) (time.Time, error) {
