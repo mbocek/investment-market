@@ -1,0 +1,18 @@
+alpha_vantage:
+  base_url: "https://www.alphavantage.co/query"
+  token: "8G1PFQP4VSFHTDD9"
+influxdb:
+  bucket: "stocks"
+  org: "stocks"
+  token: "AdminToken0=="
+  url: "http://localhost:8086"
+postgres:
+  host: "localhost"
+  port: 5432
+  user: "stocks_config"
+  password: "stocks_config"
+  db: "stocks_config"
+data:
+  - symbol: "AAPL"
+    interval: "5min"
+    start: "2000-01"
